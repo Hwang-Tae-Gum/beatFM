@@ -1,8 +1,10 @@
-"""Build the manifest CSV (dataset, name, audio, annotation, fold, has_downbeats).
+"""Build the manifest CSV (dataset, name, audio, spect, annotation, fold, has_downbeats).
 
-Annotations and 8-fold splits come from the Beat This annotation set; audio paths are
-resolved per dataset. Edit AUDIO below when a dataset lives somewhere else.
+Annotations and 8-fold splits come from the Beat This annotation set.
+  --input wav   : audio paths resolved per dataset (edit AUDIO below); tracks without audio are skipped
+  --input spect : Beat This spectrograms (SPECT_ROOT/<dataset>.npz, key <name>/track); no audio needed
 """
+
 import argparse
 import csv
 import json
@@ -10,6 +12,8 @@ from pathlib import Path
 
 ANN_ROOT = Path("/disk1/jaehoon/dataset_store/beat_this_annotations")
 LABELED = Path("/home/taegum/mnt/labeled_data")
+SPECT_ROOT = Path("/disk1/taegum/mnt/AlignBeat/data/audio/spectrograms")
+
 
 AUDIO = {
     "ballroom": LABELED / "ballroom/data",
@@ -56,16 +60,20 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="manifest.csv")
     p.add_argument("--datasets", nargs="*", default=list(AUDIO))
+    p.add_argument("--input", choices=["wav", "spect"], default="wav")
     args = p.parse_args()
 
     from data import CV_DATASETS
+    from mmnpz import MemmappedNpzFile
 
     rows, missing = [], {}
     for dataset in args.datasets:
-        if AUDIO[dataset] is None:
+        if args.input == "wav" and AUDIO[dataset] is None:
             print(f"[skip] {dataset}: audio path not set")
             continue
         ann_dir = ANN_ROOT / ("rwc" if dataset == "rwc_popular" else dataset)
+        spect = SPECT_ROOT / f"{ann_dir.name}.npz"
+        spect_keys = set(MemmappedNpzFile(spect).files) if args.input == "spect" else set()
         has_db = json.loads((ann_dir / "info.json").read_text()).get("has_downbeats", True)
         folds = read_folds(ann_dir)
         beat_files = sorted((ann_dir / "annotations/beats").glob("*.beats"))
@@ -74,18 +82,21 @@ def main():
         n_ok = 0
         for ann in beat_files:
             name = ann.stem
-            audio = audio_path(dataset, name)
-            if not audio.exists():
+            if ann.stat().st_size == 0:                               # no beats annotated (beatles Revolution 9)
+                continue
+            audio = audio_path(dataset, name) if AUDIO[dataset] is not None else None
+            found = f"{name}/track" in spect_keys if args.input == "spect" else audio.exists()
+            if not found:
                 missing.setdefault(dataset, []).append(name)
                 continue
             fold = folds.get(name, -1) if dataset in CV_DATASETS else -1
-            rows.append({"dataset": dataset, "name": name, "audio": str(audio), "annotation": str(ann),
-                         "fold": fold, "has_downbeats": int(has_db)})
+            rows.append({"dataset": dataset, "name": name, "audio": str(audio or ""), "spect": str(spect),
+                         "annotation": str(ann), "fold": fold, "has_downbeats": int(has_db)})
             n_ok += 1
-        print(f"{dataset:12s} {n_ok:4d} tracks  (missing audio: {len(missing.get(dataset, []))})")
+        print(f"{dataset:12s} {n_ok:4d} tracks  (missing {args.input}: {len(missing.get(dataset, []))})")
 
     with open(args.out, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["dataset", "name", "audio", "annotation", "fold", "has_downbeats"])
+        w = csv.DictWriter(f, fieldnames=["dataset", "name", "audio", "spect", "annotation", "fold", "has_downbeats"])
         w.writeheader()
         w.writerows(rows)
     print(f"wrote {len(rows)} rows -> {args.out}")

@@ -3,3 +3,6 @@ __pycache__/
 runs/
 cache/
 manifest.csv
+logs/
+runs_smoke/
+manifest_*.csv

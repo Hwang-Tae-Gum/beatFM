@@ -5,6 +5,8 @@ from einops import rearrange
 from MusicFMExtractor import MusicFMExtractor
 from MSAM import MSAM
 
+from spect_convert import bt_to_musicfm, build_freq_map
+
 
 class BeatFM(nn.Module):
     """BeatFM = frozen MusicFM -> MSAM -> FC classifier
@@ -13,9 +15,16 @@ class BeatFM(nn.Module):
     """
 
     def __init__(self, layers=None, feat_dim=1024, hidden_dim=512, classifier="mlp",
-                 dilations=(1, 2, 4, 8), kernel_size=3, embed_dim=16):
+                 dilations=(1, 2, 4, 8), kernel_size=3, embed_dim=16, input_type = "wav"):
         super().__init__()
         self.extractor = MusicFMExtractor(layers=layers)
+        self.input_type = input_type                                                        # NEW
+        if input_type == "spect":                                                           # NEW
+            width_bt, freq_map = build_freq_map()                 # fixed; rebuilt on load, not saved
+            self.register_buffer("width_bt", width_bt, persistent=False)
+            self.register_buffer("freq_map", freq_map, persistent=False)
+        elif input_type != "wav":                                                           # NEW
+            raise ValueError(f"unknown input_type: {input_type}")
         n_layers = self.extractor.n_layers
         self.msam = MSAM(n_layers, dilations, kernel_size, embed_dim)
 
@@ -32,8 +41,14 @@ class BeatFM(nn.Module):
         else:
             raise ValueError(f"unknown classifier: {classifier}")
 
-    def forward(self, wav):                                   # (B, samples)
-        h = self.extractor(wav)                               # (B, N, F, T)   Eq.(1)(2)
+    def features(self, x):
+        if self.input_type == "wav":
+            return self.extractor(x)
+        mel = bt_to_musicfm(x, self.extractor.musicfm.stat, self.width_bt, self.freq_map)
+        return self.extractor.forward_mel(mel)
+    
+    def forward(self, x):                                   # (B, samples)
+        h = self.features(x)                             # (B, N, F, T)   Eq.(1)(2)
         h = self.msam(h)                                      # (B, N, F, T)   Eq.(3)-(10)
         h = rearrange(h, "b n f t -> b t (n f)")              # (B, T, N*F)
         logits = self.classifier(h)                           # (B, T, 2)

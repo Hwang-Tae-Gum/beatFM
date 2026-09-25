@@ -38,6 +38,13 @@ class MusicFMExtractor(nn.Module):
         h = torch.stack([hidden_emb[i] for i in self.layers], dim = 1)
         return h.transpose(2, 3)
 
+    def forward_mel(self, mel):
+        """mel: (B, 128, T_mel) normalized MusicFM input at 100 fps -> (B, N, F, T_mel / 4)"""
+        with torch.set_grad_enabled(not self.freeze):
+            _, hidden_emb = self.musicfm.encoder(mel)
+        h = torch.stack([hidden_emb[i] for i in self.layers], dim=1)
+        return h.transpose(2, 3)
+
 if __name__ == "__main__":
     import argparse
     import librosa

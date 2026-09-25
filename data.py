@@ -7,9 +7,15 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from mmnpz import MemmappedNpzFile
+
 SR = 24000                  # MusicFM input sample rate
 FPS = 25                    # MusicFM output frame rate
 HOP = SR // FPS             # 960 samples per output frame
+
+BT_FPS = 50
+RATE = {"wav": SR, "spect": BT_FPS}
+
 WIDEN = ((0, 1.0), (1, 0.5), (2, 0.25))   # paper: +-2 frames with weights 0.5 / 0.25
 
 CV_DATASETS = ("ballroom", "hainsworth", "smc")   # 8-fold train + test
@@ -66,6 +72,18 @@ def build_cache(rows, cache_dir):
 def load_audio(row, cache_dir):
     return np.load(cache_path(row, cache_dir), mmap_mode="r")
 
+_NPZ = {}
+
+
+def load_spect(row):
+    """Beat This spectrogram (T_bt, 128) float16 at 50 fps, memory-mapped"""
+    if row["spect"] not in _NPZ:
+        _NPZ[row["spect"]] = MemmappedNpzFile(row["spect"])
+    return _NPZ[row["spect"]][f"{row['name']}/track"]
+
+
+def load_input(row, input_type, cache_dir=None):
+    return load_audio(row, cache_dir) if input_type == "wav" else load_spect(row)
 
 def frame_targets(times, n_frames, offset_sec=0.0):
     """soft targets at FPS: 1 on the annotated frame, 0.5 at +-1, 0.25 at +-2"""
@@ -82,15 +100,18 @@ def frame_targets(times, n_frames, offset_sec=0.0):
 class ClipDataset(Dataset):
     """15 s clips with 5 s overlap (hop 10 s), paper Sec. IV-B"""
 
-    def __init__(self, rows, cache_dir, clip_sec=15, hop_sec=10):
-        self.rows, self.cache_dir = rows, cache_dir
-        self.clip = clip_sec * SR                 # multiple of HOP -> exactly clip_sec * FPS frames
-        self.n_frames = self.clip // HOP
+    def __init__(self, rows, cache_dir=None, clip_sec=15, hop_sec=10, input_type="wav"):
+        self.rows, self.cache_dir, self.input_type = rows, cache_dir, input_type
+        rate = RATE[input_type]
+        self.rate = rate
+        self.clip = clip_sec * rate               # exactly clip_sec * FPS output frames
+        self.per_frame = rate // FPS              # input steps per output frame (960 or 2)
+        self.n_frames = self.clip // self.per_frame
         self.ann = [load_annotation(r["annotation"]) for r in rows]
         self.index = []
         for i, r in enumerate(rows):
-            n = len(load_audio(r, cache_dir))
-            starts = list(range(0, max(n - self.clip, 0) + 1, hop_sec * SR))
+            n = len(load_input(r, input_type, cache_dir))
+            starts = list(range(0, max(n - self.clip, 0) + 1, hop_sec * rate))
             if starts[-1] + self.clip < n:        # cover the tail
                 starts.append(n - self.clip)
             self.index += [(i, s) for s in starts]
@@ -101,15 +122,15 @@ class ClipDataset(Dataset):
     def __getitem__(self, k):
         i, start = self.index[k]
         row = self.rows[i]
-        seg = np.asarray(load_audio(row, self.cache_dir)[start:start + self.clip], dtype=np.float32)
-        wav = np.zeros(self.clip, np.float32)
-        wav[:len(seg)] = seg
+        seg = np.asarray(load_input(row, self.input_type, self.cache_dir)[start:start + self.clip], dtype=np.float32)
+        x = np.zeros((self.clip,) + seg.shape[1:], np.float32)   # (samples,) or (frames, 128)
+        x[:len(seg)] = seg
         mask = np.zeros(self.n_frames, bool)
-        mask[:int(np.ceil(len(seg) / HOP))] = True
+        mask[:int(np.ceil(len(seg) / self.per_frame))] = True
         beats, downbeats = self.ann[i]
-        offset = start / SR
+        offset = start / self.rate
         return {
-            "wav": torch.from_numpy(wav),                                                # (samples,)
+            "x": torch.from_numpy(x),                                                    # wav or spect
             "beat": torch.from_numpy(frame_targets(beats, self.n_frames, offset)),       # (T,)
             "downbeat": torch.from_numpy(frame_targets(downbeats, self.n_frames, offset)),
             "mask": torch.from_numpy(mask),                                              # (T,)
@@ -117,24 +138,27 @@ class ClipDataset(Dataset):
         }
 
 
+
 class PieceDataset(Dataset):
     """whole pieces for testing (paper: complete, unsegmented pieces)"""
 
-    def __init__(self, rows, cache_dir):
-        self.rows, self.cache_dir = rows, cache_dir
+    def __init__(self, rows, cache_dir=None, input_type="wav"):
+        self.rows, self.cache_dir, self.input_type = rows, cache_dir, input_type
+
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, i):
         row = self.rows[i]
-        wav = np.asarray(load_audio(row, self.cache_dir), dtype=np.float32)
+        x = np.asarray(load_input(row, self.input_type, self.cache_dir), dtype=np.float32)
         beats, downbeats = load_annotation(row["annotation"])
         return {
-            "wav": torch.from_numpy(wav),
+            "x": torch.from_numpy(x),
             "beats": beats,
             "downbeats": downbeats,
             "has_downbeats": row["has_downbeats"],
             "dataset": row["dataset"],
             "name": row["name"],
         }
+

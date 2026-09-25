@@ -11,7 +11,7 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
-from data import FPS, HOP, ClipDataset, PieceDataset, build_cache, read_manifest, split_rows
+from data import FPS, RATE, ClipDataset, PieceDataset, build_cache, read_manifest, split_rows
 from model import BeatFM
 
 
@@ -33,10 +33,12 @@ def first(batch):
 
 class PLBeatFM(LightningModule):
     def __init__(self, lr=3e-4, layers=None, hidden_dim=512, classifier="mlp", embed_dim=16,
-                 dbn=True, chunk_sec=0.0, trim_sec=5.0):
+                 dbn=True, chunk_sec=0.0, trim_sec=5.0, input_type="wav"):
         super().__init__()
         self.save_hyperparameters()
-        self.model = BeatFM(layers=layers, hidden_dim=hidden_dim, classifier=classifier, embed_dim=embed_dim)
+        self.model = BeatFM(layers=layers, hidden_dim=hidden_dim, classifier=classifier, embed_dim=embed_dim,
+                            input_type=input_type)
+        self.per_frame = RATE[input_type] // FPS                             # input steps per output frame
         self.dbn = None
         if dbn:
             from madmom.features.downbeats import DBNDownBeatTrackingProcessor
@@ -44,9 +46,10 @@ class PLBeatFM(LightningModule):
                                                     fps=FPS, transition_lambda=100)
         self.test_results = []
 
+
     # ---- training ---------------------------------------------------------------
     def _losses(self, batch):
-        beat, down = self.model(batch["wav"])                                # (B, T) each
+        beat, down = self.model(batch["x"])                                  # (B, T) each
         mask = batch["mask"].float()
         db_mask = mask * batch["has_downbeats"].float()[:, None]             # e.g. SMC has no downbeats
         return masked_bce(beat, batch["beat"], mask), masked_bce(down, batch["downbeat"], db_mask)
@@ -54,13 +57,13 @@ class PLBeatFM(LightningModule):
     def training_step(self, batch, _):
         lb, ld = self._losses(batch)
         self.log_dict({"train_loss": lb + ld, "train_beat": lb, "train_downbeat": ld},
-                      on_step=False, on_epoch=True, batch_size=len(batch["wav"]))
+                      on_step=False, on_epoch=True, batch_size=len(batch["x"]))
         return lb + ld
 
     def validation_step(self, batch, _):
         lb, ld = self._losses(batch)
         self.log_dict({"val_loss": lb + ld, "val_beat": lb, "val_downbeat": ld},
-                      on_epoch=True, prog_bar=True, batch_size=len(batch["wav"]))
+                      on_epoch=True, prog_bar=True, batch_size=len(batch["x"]))
 
     def configure_optimizers(self):
         return torch.optim.Adam([p for p in self.parameters() if p.requires_grad], lr=self.hparams.lr)
@@ -74,26 +77,30 @@ class PLBeatFM(LightningModule):
 
     # ---- testing on whole pieces --------------------------------------------------
     @torch.no_grad()
-    def predict_piece(self, wav):
-        """whole piece -> framewise probabilities (T,); chunk_sec > 0 splits long pieces"""
-        n = -(-len(wav) // HOP) * HOP
-        wav = F.pad(wav, (0, n - len(wav)))                                  # multiple of HOP -> T = n / HOP
-        T, win = n // HOP, int(self.hparams.chunk_sec * FPS)
+    def predict_piece(self, x):
+        """whole piece (wav (samples,) or spect (T_bt, 128)) -> framewise probabilities (T,)
+        chunk_sec > 0 splits long pieces"""
+        p = self.per_frame                                                   # 960 samples or 2 spect frames
+        n = -(-len(x) // p) * p
+        x = torch.cat([x, x.new_zeros((n - len(x),) + x.shape[1:])])         # multiple of p -> T = n / p
+        T, win = n // p, int(self.hparams.chunk_sec * FPS)
         if win <= 0 or T <= win:
-            beat, down = self.model(wav[None])
+            beat, down = self.model(x[None])
             return beat[0].sigmoid(), down[0].sigmoid()
         border = win // 8
-        beat, down = torch.zeros(T, device=wav.device), torch.zeros(T, device=wav.device)
+        beat, down = torch.zeros(T, device=x.device), torch.zeros(T, device=x.device)
         for s in list(range(0, T - win, win - 2 * border)) + [T - win]:
-            b, d = self.model(wav[s * HOP:(s + win) * HOP][None])
+            b, d = self.model(x[s * p:(s + win) * p][None])
             lo = 0 if s == 0 else border                                     # later windows overwrite borders
             beat[s + lo:s + win], down[s + lo:s + win] = b[0, lo:].sigmoid(), d[0, lo:].sigmoid()
         return beat, down
 
+
     def decode(self, beat, down):
         beat, down = beat.float().cpu().numpy(), down.float().cpu().numpy()
         if self.dbn is not None:
-            act = np.stack([np.clip(beat - down, 0, 1), down], axis=1)       # madmom: (beat-only, downbeat)
+            eps = 1e-5                                                       # madmom takes log -> avoid log(0)
+            act = np.stack([np.clip(beat - down, eps, 1), np.clip(down, eps, 1)], axis=1)   # (beat-only, downbeat)
             out = self.dbn(act)
             if len(out) == 0:
                 return np.zeros(0), np.zeros(0)
@@ -102,15 +109,16 @@ class PLBeatFM(LightningModule):
         def peaks(p):                                                        # fallback: local maxima > 0.5
             return np.flatnonzero((p > 0.5) & (p >= np.roll(p, 1)) & (p >= np.roll(p, -1))) / FPS
         return peaks(beat), peaks(down)
-
+    
     def test_step(self, item, _):
-        est_beats, est_downbeats = self.decode(*self.predict_piece(item["wav"]))
+        est_beats, est_downbeats = self.decode(*self.predict_piece(item["x"]))
         res = {"dataset": item["dataset"]}
         res.update({f"beat_{k}": v for k, v in beat_scores(item["beats"], est_beats, self.hparams.trim_sec).items()})
         if item["has_downbeats"]:
             res.update({f"downbeat_{k}": v for k, v in
                         beat_scores(item["downbeats"], est_downbeats, self.hparams.trim_sec).items()})
         self.test_results.append(res)
+
 
     def on_test_epoch_end(self):
         by_ds = defaultdict(list)
@@ -132,7 +140,9 @@ class PLBeatFM(LightningModule):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--manifest", required=True)
-    p.add_argument("--cache-dir", required=True, help="where 24 kHz mono .npy copies are stored")
+    p.add_argument("--input", choices=["wav", "spect"], default="wav",
+                   help="wav: audio -> MusicFM mel / spect: Beat This spectrogram converted to MusicFM mel")
+    p.add_argument("--cache-dir", default=None, help="wav only: where 24 kHz mono .npy copies are stored")
     p.add_argument("--fold", type=int, default=0, help="8-fold CV fold held out for testing")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=16)
@@ -156,18 +166,21 @@ def main():
     train_rows, val_rows, test_rows = split_rows(rows, args.fold, args.val_ratio, args.seed)
     if args.limit_tracks:
         train_rows, val_rows, test_rows = (r[:args.limit_tracks] for r in (train_rows, val_rows, test_rows))
-    build_cache(train_rows + val_rows + test_rows, args.cache_dir)
-    print(f"tracks  train {len(train_rows)}  val {len(val_rows)}  test {len(test_rows)}")
+    if args.input == "wav":
+        if args.cache_dir is None:
+            p.error("--cache-dir is required with --input wav")
+        build_cache(train_rows + val_rows + test_rows, args.cache_dir)
+    print(f"tracks  train {len(train_rows)}  val {len(val_rows)}  test {len(test_rows)}  (input: {args.input})")
 
-    train_dl = DataLoader(ClipDataset(train_rows, args.cache_dir), batch_size=args.batch_size,
+    train_dl = DataLoader(ClipDataset(train_rows, args.cache_dir, input_type=args.input), batch_size=args.batch_size,
                           shuffle=True, drop_last=True, num_workers=args.num_workers)
-    val_dl = DataLoader(ClipDataset(val_rows, args.cache_dir), batch_size=args.batch_size,
+    val_dl = DataLoader(ClipDataset(val_rows, args.cache_dir, input_type=args.input), batch_size=args.batch_size,
                         num_workers=args.num_workers)
-    test_dl = DataLoader(PieceDataset(test_rows, args.cache_dir), batch_size=1, collate_fn=first,
-                         num_workers=args.num_workers)
+    test_dl = DataLoader(PieceDataset(test_rows, args.cache_dir, input_type=args.input), batch_size=1,
+                         collate_fn=first, num_workers=args.num_workers)
 
     model = PLBeatFM(lr=args.lr, layers=args.layers, classifier=args.classifier,
-                     dbn=not args.no_dbn, chunk_sec=args.chunk_sec)
+                     dbn=not args.no_dbn, chunk_sec=args.chunk_sec, input_type=args.input)
     run_dir = Path(args.out_dir) / f"fold{args.fold}"
     ckpt = ModelCheckpoint(dirpath=run_dir / "checkpoints", monitor="val_loss", mode="min", save_top_k=1)
     cuda = torch.cuda.is_available()
@@ -181,6 +194,7 @@ def main():
     )
     trainer.fit(model, train_dl, val_dl)
     trainer.test(model, test_dl, ckpt_path="best")
+
 
 
 if __name__ == "__main__":
