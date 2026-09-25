@@ -6,3 +6,4 @@ manifest.csv
 logs/
 runs_smoke/
 manifest_*.csv
+runs_*/

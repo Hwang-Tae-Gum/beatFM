@@ -15,22 +15,31 @@ class BeatFM(nn.Module):
     """
 
     def __init__(self, layers=None, feat_dim=1024, hidden_dim=512, classifier="mlp",
-                 dilations=(1, 2, 4, 8), kernel_size=3, embed_dim=16, input_type = "wav"):
+                 dilations=(1, 2, 4, 8), kernel_size=3, embed_dim=16, input_type="wav"):
         super().__init__()
         self.extractor = MusicFMExtractor(layers=layers)
-        self.input_type = input_type                                                        # NEW
-        if input_type == "spect":                                                           # NEW
+        self.input_type = input_type
+        if input_type == "spect":
             width_bt, freq_map = build_freq_map()                 # fixed; rebuilt on load, not saved
             self.register_buffer("width_bt", width_bt, persistent=False)
             self.register_buffer("freq_map", freq_map, persistent=False)
-        elif input_type != "wav":                                                           # NEW
+        elif input_type != "wav":
             raise ValueError(f"unknown input_type: {input_type}")
         n_layers = self.extractor.n_layers
         self.msam = MSAM(n_layers, dilations, kernel_size, embed_dim)
 
         # paper: "fully connected layers" (depth / activation not specified)
+        self.classifier_type = classifier
         in_dim = n_layers * feat_dim
-        if classifier == "mlp":
+        if classifier == "weighted":
+            # learnable softmax weights over the N layers -> (B, T, F), then the same MLP on F = 1024 dims
+            self.layer_logits = nn.Parameter(torch.zeros(n_layers))           # uniform at init
+            self.classifier = nn.Sequential(
+                nn.Linear(feat_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 2),
+            )
+        elif classifier == "mlp":
             self.classifier = nn.Sequential(
                 nn.Linear(in_dim, hidden_dim),
                 nn.ReLU(),
@@ -41,15 +50,21 @@ class BeatFM(nn.Module):
         else:
             raise ValueError(f"unknown classifier: {classifier}")
 
+
     def features(self, x):
         if self.input_type == "wav":
             return self.extractor(x)
         mel = bt_to_musicfm(x, self.extractor.musicfm.stat, self.width_bt, self.freq_map)
         return self.extractor.forward_mel(mel)
     
-    def forward(self, x):                                   # (B, samples)
-        h = self.features(x)                             # (B, N, F, T)   Eq.(1)(2)
+    def forward(self, x):                                     # wav (B, samples) or spect (B, T_bt, 128)
+        h = self.features(x)                                  # (B, N, F, T)   Eq.(1)(2)
         h = self.msam(h)                                      # (B, N, F, T)   Eq.(3)-(10)
-        h = rearrange(h, "b n f t -> b t (n f)")              # (B, T, N*F)
+        if self.classifier_type == "weighted":
+            w = self.layer_logits.softmax(0)                  # (N,)
+            h = torch.einsum("bnft,n->btf", h, w)             # (B, T, F)
+        else:
+            h = rearrange(h, "b n f t -> b t (n f)")          # (B, T, N*F)
         logits = self.classifier(h)                           # (B, T, 2)
         return logits[..., 0], logits[..., 1]                 # beat, downbeat
+

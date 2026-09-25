@@ -33,7 +33,7 @@ def first(batch):
 
 class PLBeatFM(LightningModule):
     def __init__(self, lr=3e-4, layers=None, hidden_dim=512, classifier="mlp", embed_dim=16,
-                 dbn=True, chunk_sec=0.0, trim_sec=5.0, input_type="wav"):
+                 dbn=True, chunk_sec=0.0, trim_sec=5.0, input_type="wav", dbn_fps=50):
         super().__init__()
         self.save_hyperparameters()
         self.model = BeatFM(layers=layers, hidden_dim=hidden_dim, classifier=classifier, embed_dim=embed_dim,
@@ -42,9 +42,12 @@ class PLBeatFM(LightningModule):
         self.dbn = None
         if dbn:
             from madmom.features.downbeats import DBNDownBeatTrackingProcessor
+            # the DBN models beat intervals in whole frames: at 25 fps, 120 BPM (12.5 frames) can only be
+            # 12 or 13 frames -> tempo drifts. Activations are upsampled to dbn_fps before decoding.
             self.dbn = DBNDownBeatTrackingProcessor(beats_per_bar=[3, 4], min_bpm=55.0, max_bpm=215.0,
-                                                    fps=FPS, transition_lambda=100)
+                                                    fps=dbn_fps, transition_lambda=100)
         self.test_results = []
+
 
 
     # ---- training ---------------------------------------------------------------
@@ -99,12 +102,21 @@ class PLBeatFM(LightningModule):
     def decode(self, beat, down):
         beat, down = beat.float().cpu().numpy(), down.float().cpu().numpy()
         if self.dbn is not None:
+            fps = self.hparams.dbn_fps
+            t_in = np.arange(len(beat)) / FPS                               # model output: 25 fps
+            t_out = np.arange(int(len(beat) * fps / FPS)) / fps             # DBN input: dbn_fps
+            beat, down = np.interp(t_out, t_in, beat), np.interp(t_out, t_in, down)
             eps = 1e-5                                                       # madmom takes log -> avoid log(0)
             act = np.stack([np.clip(beat - down, eps, 1), np.clip(down, eps, 1)], axis=1)   # (beat-only, downbeat)
             out = self.dbn(act)
             if len(out) == 0:
                 return np.zeros(0), np.zeros(0)
             return out[:, 0], out[out[:, 1] == 1, 0]
+
+        def peaks(p):                                                        # fallback: local maxima > 0.5
+            return np.flatnonzero((p > 0.5) & (p >= np.roll(p, 1)) & (p >= np.roll(p, -1))) / FPS
+        return peaks(beat), peaks(down)
+
 
         def peaks(p):                                                        # fallback: local maxima > 0.5
             return np.flatnonzero((p > 0.5) & (p >= np.roll(p, 1)) & (p >= np.roll(p, -1))) / FPS
@@ -150,7 +162,7 @@ def main():
     p.add_argument("--patience", type=int, default=20)
     p.add_argument("--max-epochs", type=int, default=1000)
     p.add_argument("--val-ratio", type=float, default=0.1, help="fraction of training pieces for validation")
-    p.add_argument("--classifier", choices=["mlp", "linear"], default="mlp")
+    p.add_argument("--classifier", choices=["mlp", "linear", "weighted"], default="mlp")
     p.add_argument("--layers", type=int, nargs="*", default=None, help="MusicFM hidden states (default: all 13)")
     p.add_argument("--no-dbn", action="store_true", help="peak picking instead of the DBN")
     p.add_argument("--chunk-sec", type=float, default=0.0, help="test-time window; 0 = whole piece")
@@ -158,6 +170,7 @@ def main():
     p.add_argument("--precision", default="32-true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", default="runs")
+    p.add_argument("--save-all", action="store_true", help="keep a checkpoint for every epoch (default: best only)")
     p.add_argument("--limit-tracks", type=int, default=0, help="debug: keep only N tracks per split")
     args = p.parse_args()
 
@@ -182,7 +195,8 @@ def main():
     model = PLBeatFM(lr=args.lr, layers=args.layers, classifier=args.classifier,
                      dbn=not args.no_dbn, chunk_sec=args.chunk_sec, input_type=args.input)
     run_dir = Path(args.out_dir) / f"fold{args.fold}"
-    ckpt = ModelCheckpoint(dirpath=run_dir / "checkpoints", monitor="val_loss", mode="min", save_top_k=1)
+    ckpt = ModelCheckpoint(dirpath=run_dir / "checkpoints", monitor="val_loss", mode="min",
+                           save_top_k=-1 if args.save_all else 1)
     cuda = torch.cuda.is_available()
     trainer = Trainer(
         max_epochs=args.max_epochs,
@@ -194,6 +208,7 @@ def main():
     )
     trainer.fit(model, train_dl, val_dl)
     trainer.test(model, test_dl, ckpt_path="best")
+
 
 
 

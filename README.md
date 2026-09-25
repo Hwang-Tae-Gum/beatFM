@@ -8,7 +8,7 @@
 | Beat | 89.1 | 80.6 | 93.5 |
 | Downbeat | 79.6 | 74.4 | 88.7 |
 
-**현재 상태:** 입력으로 **Beat This가 제공하는 spectrogram**(`<dataset>.npz`)을 받을 수 있게 했습니다(`--input spect`). 오디오 입력(`--input wav`)도 그대로 쓸 수 있습니다. GPU에서 학습 → validation → 체크포인트 → test(DBN) 점수표까지 확인했고, 본 학습(fold 0, 30 epoch)을 돌리고 있습니다.
+**현재 상태:** 입력으로 **Beat This가 제공하는 spectrogram**(`<dataset>.npz`)을 받을 수 있게 했습니다(`--input spect`). 오디오 입력(`--input wav`)도 그대로 쓸 수 있습니다. fold 0 학습 결과 GTZAN beat F 88.0 / downbeat F 77.5로, 논문과 F는 1–2점, CMLt는 2–3점 차이입니다(아래 "결과").
 
 ---
 
@@ -69,9 +69,13 @@ wget -P third_party/musicfm/data https://huggingface.co/minzwon/MusicFM/resolve/
 # 1. manifest: Beat This .npz 기준 (Harmonix 포함 3,313곡)
 python make_manifest.py --input spect --out manifest_spect.csv
 
-# 2. 학습 + test (fold 0, 30 epoch)
+# 2. 학습 + test (최종 설정 B: fold 0, lr 1e-4, 10 epoch, 모든 epoch 체크포인트 저장)
 nohup python -u train.py --manifest manifest_spect.csv --input spect --fold 0 --gpu 0 \
-    --max-epochs 30 > logs/spect_fold0_ep30.log 2>&1 &
+    --lr 1e-4 --max-epochs 10 --patience 10 --save-all --out-dir runs_B > logs/B.log 2>&1 &
+
+# 3. 저장된 체크포인트를 따로 평가 (--split val: epoch 선택용, test: 최종 점수)
+python scripts/eval_ckpt.py --ckpt runs_B/fold0/checkpoints/epoch=2-step=4995.ckpt \
+    --manifest manifest_spect.csv --split test --gpu 0
 ```
 - spectrogram 위치: `make_manifest.py`의 `SPECT_ROOT` (`<dataset>.npz`, key `<name>/track`)
 - 오디오 캐시가 필요 없습니다 (`--cache-dir` 불필요).
@@ -164,16 +168,38 @@ upsample_time    50 → 100 fps 선형 보간
 | MS-Conv 채널 해석 | N(층)을 채널로, T 또는 F 방향 conv | `MSAM.py` |
 | MS-Conv 뒤 MLP | 1×1 conv 2층, hidden = N, ReLU | `MSAM.py` |
 | channel Q/K/V Conv | 층당 스칼라 → `Conv1d(1, C=16, 1)`, head 1개, 출력 `Conv1d(C, 1, 1)` | `MSAM.py` |
-| classifier | N·F flatten → Linear(512) → ReLU → Linear(2) ("fully connected layers") | `--classifier mlp/linear` |
+| classifier | N·F flatten → Linear(512) → ReLU → Linear(2) ("fully connected layers"). `weighted`: 층 softmax 가중합(1024) → 같은 MLP | `--classifier mlp/linear/weighted` |
 | beat/downbeat 출력 | 독립 | `model.py` |
 | val 비율 | 학습 곡의 10% (곡 단위) | `--val-ratio` |
 | weight decay / scheduler / augmentation | 없음 | — |
-| DBN | beats_per_bar [3,4], 55–215 bpm, transition_lambda 100 | `train.py` |
+| DBN | madmom `DBNDownBeatTrackingProcessor`, beats_per_bar [3,4], 55–215 bpm, transition_lambda 100 (Beat This 설정, madmom 기본값) | `train.py` |
+| DBN 입력 frame rate | 모델 출력(25 fps)을 **50 fps로 선형 보간** 후 DBN (Beat This와 동일). 25 fps 그대로면 템포가 정수 frame으로 양자화돼 CMLt가 크게 떨어짐 | `dbn_fps` |
 | test 입력 | 곡 전체 한 번에 | `--chunk-sec` |
 | 평가 시 앞부분 제외 | 5 s (mir_eval 관례) | `train.py` |
 | precision | fp32 | `--precision` |
 | spect 변환 dB offset | 34.49 (GTZAN 10곡으로 맞춤, 곡별 편차 0.14 dB) | `spect_convert.py` |
 | DBN 입력 하한 | 1e-5 (madmom log(0) 방지) | `train.py` |
+
+---
+
+## 결과 (fold 0, GTZAN)
+
+모든 실험은 Beat This spectrogram 입력, 10 epoch, 모든 epoch 체크포인트 저장, val loss 최저 epoch으로 test, DBN 50 fps.
+
+| 실행 | 설정 | best ep | beat F | CMLt | AMLt | downbeat F | CMLt | AMLt |
+|---|---|---|---|---|---|---|---|---|
+| A | 기본 (MLP, lr 3e-4) | 1 | 87.9 | 78.5 | 92.6 | 76.8 | 70.7 | 89.0 |
+| **B** | **lr 1e-4 (최종)** | 2 | **88.0** | **78.9** | **92.4** | **77.5** | **71.8** | **89.4** |
+| C | linear classifier (2.7만 파라미터) | 4 | 87.8 | 78.1 | 92.7 | 77.3 | 71.5 | 89.3 |
+| D | 층 가중합 classifier (0.53M) | 4 | 87.4 | 77.5 | 92.2 | 76.7 | 70.5 | 89.2 |
+| E | **오디오 입력** (Harmonix 없음, GTZAN 993곡) | 1 | 86.9 | 76.0 | 93.6 | 80.1 | 72.2 | 91.3 |
+| 📄 논문 | BeatFM (MusicFM) | – | 89.1 | 80.6 | 93.5 | 79.6 | 74.4 | 88.7 |
+
+- **DBN frame rate가 가장 큰 요인이었습니다.** 같은 모델(A, epoch 1)에서 DBN을 25 fps → 50 fps로 바꾸면 beat F 78.5 → 87.8, beat CMLt 56.5 → 78.5, downbeat CMLt 51.5 → 70.6.
+- classifier 구조, lr, epoch은 점수를 1점 안쪽으로만 바꿉니다. val loss는 epoch 1–2 이후 오르지만 val 점수(F, CMLt)는 epoch 내내 거의 일정합니다.
+- 층 가중합(D)에서 학습된 층 가중치는 9번째 conformer 층이 0.27로 가장 크고 8, 10번이 그다음입니다(초기값 1/13 = 0.077).
+- DBN 설정(λ 50/100/200, 50/100 fps, BPM 범위)과 시간 보정(0/+10/+20 ms)을 val로 비교했지만 GTZAN CMLt는 최대 +0.6이었습니다. 남은 CMLt 차이는 후처리가 아니라 입력 feature나 평가 조건(GTZAN annotation 버전 등) 쪽으로 보입니다.
+- E(오디오 입력)는 downbeat가 3점 높지만 학습 데이터에 Harmonix가 없어 변환 손실만의 효과로 볼 수는 없습니다.
 
 ---
 
@@ -183,4 +209,6 @@ upsample_time    50 → 100 fps 선형 보간
 - ✅ Beat This spectrogram 입력: 변환 검증, 시간 정렬, 15 s clip → 375 frame
 - ✅ GPU(RTX A6000) 학습 → val → 체크포인트 → test(DBN) 점수표까지 동작
 - ✅ 긴 곡 chunk 추론 로직 (`--chunk-sec`)
-- ⏳ 본 학습: spect 입력, fold 0, 30 epoch (epoch당 약 13분)
+- ✅ fold 0 학습, 설정 비교 (A–E), DBN frame rate 문제 해결
+- ⏳ 나머지 fold (1–7)
+- ⏳ Harmonix를 뺀 spectrogram 학습으로 변환 손실만 따로 측정
